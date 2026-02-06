@@ -204,17 +204,15 @@ portainer_auth() {
   log_info "Autenticado na API Portainer."
 }
 
-# Retorna endpoint/environment ID (normalmente 1). O agent pode demorar alguns segundos para registrar.
-# Portainer 2.19+ usa GET /api/environments; versões antigas usam GET /api/endpoints.
+# Retorna endpoint ID (normalmente 1). O agent pode demorar alguns segundos para registrar.
+# Portainer CE usa GET /api/endpoints (não /api/environments).
 get_endpoint_id() {
-  local res i=0 max=24 url
+  local res i=0 max=24
+  local url="http://127.0.0.1:9000/api/endpoints"
   PORTAINER_ENDPOINT_ID=""
   log_info "Aguardando endpoint do Portainer (agent) ficar disponível..."
   while true; do
-    res=""
-    for url in "http://127.0.0.1:9000/api/environments" "http://127.0.0.1:9000/api/endpoints"; do
-      res=$(curl -sf "$url" -H "Authorization: Bearer ${PORTAINER_JWT}" 2>/dev/null) && break || true
-    done
+    res=$(curl -sf "$url" -H "Authorization: Bearer ${PORTAINER_JWT}" 2>/dev/null) || res=""
     if [[ -n "$res" ]]; then
       if command -v jq &>/dev/null; then
         PORTAINER_ENDPOINT_ID=$(echo "$res" | jq -r '(if type == "array" then .[0] else .endpoints[0] end | .Id // .id)? // empty' 2>/dev/null)
@@ -229,8 +227,8 @@ get_endpoint_id() {
     i=$((i+1))
     if [[ $i -ge $max ]]; then
       log_err "Nenhum endpoint encontrado (agent pode não ter registrado a tempo)."
-      res=$(curl -s -w "\n%{http_code}" "http://127.0.0.1:9000/api/environments" -H "Authorization: Bearer ${PORTAINER_JWT}" 2>/dev/null)
-      log_err "GET /api/environments HTTP: $(echo "$res" | tail -n1). Body: $(echo "$res" | sed '$d' | tail -c 200)"
+      res=$(curl -s -w "\n%{http_code}" "$url" -H "Authorization: Bearer ${PORTAINER_JWT}" 2>/dev/null)
+      log_err "GET $url HTTP: $(echo "$res" | tail -n1). Body: $(echo "$res" | sed '$d' | tail -c 300)"
       exit 1
     fi
     sleep 5
