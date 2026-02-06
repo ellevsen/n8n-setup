@@ -204,16 +204,32 @@ portainer_auth() {
   log_info "Autenticado na API Portainer."
 }
 
-# Retorna endpoint ID (normalmente 1)
+# Retorna endpoint ID (normalmente 1). O agent pode demorar alguns segundos para registrar o ambiente.
 get_endpoint_id() {
-  local res
-  res=$(curl -sf "http://127.0.0.1:9000/api/endpoints" -H "Authorization: Bearer ${PORTAINER_JWT}")
-  PORTAINER_ENDPOINT_ID=$(echo "$res" | sed -n 's/.*"Id":\([0-9]*\).*/\1/p' | head -1)
-  if [[ -z "$PORTAINER_ENDPOINT_ID" ]]; then
-    log_err "Nenhum endpoint encontrado."
-    exit 1
-  fi
-  log_info "Endpoint ID: $PORTAINER_ENDPOINT_ID"
+  local res i=0 max=24
+  PORTAINER_ENDPOINT_ID=""
+  log_info "Aguardando endpoint do Portainer (agent) ficar disponível..."
+  while true; do
+    res=$(curl -sf "http://127.0.0.1:9000/api/endpoints" -H "Authorization: Bearer ${PORTAINER_JWT}" 2>/dev/null) || res=""
+    if [[ -n "$res" ]]; then
+      if command -v jq &>/dev/null; then
+        PORTAINER_ENDPOINT_ID=$(echo "$res" | jq -r '(if type == "array" then .[0] else .endpoints[0] end | .Id // .id)? // empty' 2>/dev/null)
+      fi
+      [[ -z "$PORTAINER_ENDPOINT_ID" ]] && PORTAINER_ENDPOINT_ID=$(echo "$res" | sed -n 's/.*"Id":\([0-9]*\).*/\1/p' | head -1)
+      [[ -z "$PORTAINER_ENDPOINT_ID" ]] && PORTAINER_ENDPOINT_ID=$(echo "$res" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+    fi
+    if [[ -n "$PORTAINER_ENDPOINT_ID" ]]; then
+      log_info "Endpoint ID: $PORTAINER_ENDPOINT_ID"
+      return 0
+    fi
+    i=$((i+1))
+    if [[ $i -ge $max ]]; then
+      log_err "Nenhum endpoint encontrado (agent pode não ter registrado a tempo)."
+      log_err "Resposta da API: $(echo "$res" | tail -c 300)"
+      exit 1
+    fi
+    sleep 5
+  done
 }
 
 # Retorna Swarm ID
