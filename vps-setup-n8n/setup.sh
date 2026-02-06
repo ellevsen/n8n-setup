@@ -229,15 +229,21 @@ deploy_portainer_stack() {
   log_info "Portainer pronto."
 }
 
-# Autentica e obtém JWT
+# Autentica e obtém JWT (token sem espaços/newlines para o header). Body em JSON via jq para senhas com aspas.
 portainer_auth() {
-  local res
+  local res body
+  body=$(jq -n --arg u "$PORTAINER_ADMIN_USER" --arg p "$PORTAINER_ADMIN_PASSWORD" '{Username: $u, Password: $p}')
   res=$(curl -sf -X POST "http://127.0.0.1:9000/api/auth" \
     -H "Content-Type: application/json" \
-    -d "{\"Username\":\"${PORTAINER_ADMIN_USER}\",\"Password\":\"${PORTAINER_ADMIN_PASSWORD}\"}")
-  PORTAINER_JWT=$(echo "$res" | sed -n 's/.*"jwt":"\([^"]*\)".*/\1/p')
+    -d "$body")
+  if command -v jq &>/dev/null; then
+    PORTAINER_JWT=$(echo "$res" | jq -r '.jwt // .token // .JWT // .Token // empty' 2>/dev/null)
+  fi
+  [[ -z "$PORTAINER_JWT" ]] && PORTAINER_JWT=$(echo "$res" | sed -n 's/.*"jwt":"\([^"]*\)".*/\1/p')
+  [[ -z "$PORTAINER_JWT" ]] && PORTAINER_JWT=$(echo "$res" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  PORTAINER_JWT=$(printf '%s' "$PORTAINER_JWT" | tr -d '\n\r \t')
   if [[ -z "$PORTAINER_JWT" ]]; then
-    log_err "Falha ao obter token Portainer. Verifique usuário/senha."
+    log_err "Falha ao obter token Portainer. Verifique usuário/senha. Resposta: ${res:0:200}"
     exit 1
   fi
   log_info "Autenticado na API Portainer."
@@ -248,10 +254,11 @@ portainer_auth() {
 get_endpoint_id() {
   local res i=0 max=24
   local url="http://127.0.0.1:9000/api/endpoints"
+  local auth_header="Authorization: Bearer ${PORTAINER_JWT}"
   PORTAINER_ENDPOINT_ID=""
   log_info "Aguardando endpoint do Portainer (agent) ficar disponível..."
   while true; do
-    res=$(curl -sf "$url" -H "Authorization: Bearer ${PORTAINER_JWT}" 2>/dev/null) || res=""
+    res=$(curl -sf "$url" -H "$auth_header" 2>/dev/null) || res=""
     if [[ -n "$res" ]]; then
       if command -v jq &>/dev/null; then
         PORTAINER_ENDPOINT_ID=$(echo "$res" | jq -r '(if type == "array" then .[0] else .endpoints[0] end | .Id // .id)? // empty' 2>/dev/null)
