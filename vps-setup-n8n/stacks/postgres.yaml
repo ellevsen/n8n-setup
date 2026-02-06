@@ -1,0 +1,57 @@
+# Postgres + init para usuário n8n (variáveis: POSTGRES_PASSWORD, N8N_DB_USER, N8N_DB_PASSWORD, N8N_DB_NAME, PGADMIN_* opcional)
+services:
+  postgres:
+    image: postgres:17-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    configs:
+      - source: postgres_init_n8n
+        target: /docker-entrypoint-initdb.d/02-create-n8n-user.sh
+        mode: 0500
+    networks:
+      - main
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - TZ=${TZ:-UTC}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 5
+
+volumes:
+  postgres_data:
+    external: true
+    name: postgres_data
+
+networks:
+  main:
+    external: true
+    name: main
+
+configs:
+  postgres_init_n8n:
+    external: true
+    name: postgres_init_n8n
