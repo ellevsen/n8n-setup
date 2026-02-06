@@ -37,7 +37,7 @@ prompt_val() {
   echo "$val"
 }
 
-# Carrega .env se existir (exporta para o shell)
+# Carrega .env e depois .setup.env (estado de run anterior, para resume)
 load_env() {
   local env_file="${SCRIPT_DIR}/.env"
   if [[ -f "$env_file" ]]; then
@@ -47,32 +47,42 @@ load_env() {
     source "$env_file"
     set +a
   fi
+  local state_file="${SCRIPT_DIR}/.setup.env"
+  if [[ -f "$state_file" ]]; then
+    log_info "Carregando estado anterior (resume)..."
+    set -a
+    # shellcheck source=/dev/null
+    source "$state_file"
+    set +a
+  fi
 }
 
-# Pergunta variáveis obrigatórias que estiverem vazias
+# Pergunta variáveis; todas opcionais. Vazias = placeholders ou senhas geradas.
+# Salva estado em .setup.env para permitir rodar de novo e continuar de onde parou.
 gather_inputs() {
-  log_info "Variáveis (use .env ou responda abaixo). Senhas vazias = geradas automaticamente."
+  log_info "Variáveis (use .env ou responda abaixo). Vazias = placeholders; senhas vazias = geradas."
   PORTAINER_ADMIN_USER="${PORTAINER_ADMIN_USER:-}"
   PORTAINER_ADMIN_USER=$(prompt_val PORTAINER_ADMIN_USER "admin")
   DOMAIN_PORTAINER="${DOMAIN_PORTAINER:-}"
-  DOMAIN_PORTAINER=$(prompt_val DOMAIN_PORTAINER "")
+  DOMAIN_PORTAINER=$(prompt_val DOMAIN_PORTAINER "portainer.local")
   DOMAIN_TRAEFIK_DASHBOARD="${DOMAIN_TRAEFIK_DASHBOARD:-}"
-  DOMAIN_TRAEFIK_DASHBOARD=$(prompt_val DOMAIN_TRAEFIK_DASHBOARD "")
+  DOMAIN_TRAEFIK_DASHBOARD=$(prompt_val DOMAIN_TRAEFIK_DASHBOARD "traefik.local")
   DOMAIN_N8N_EDITOR="${DOMAIN_N8N_EDITOR:-}"
-  DOMAIN_N8N_EDITOR=$(prompt_val DOMAIN_N8N_EDITOR "")
+  DOMAIN_N8N_EDITOR=$(prompt_val DOMAIN_N8N_EDITOR "n8n.local")
   DOMAIN_N8N_WEBHOOK="${DOMAIN_N8N_WEBHOOK:-}"
-  DOMAIN_N8N_WEBHOOK=$(prompt_val DOMAIN_N8N_WEBHOOK "")
+  DOMAIN_N8N_WEBHOOK=$(prompt_val DOMAIN_N8N_WEBHOOK "webhook.local")
   LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
-  LETSENCRYPT_EMAIL=$(prompt_val LETSENCRYPT_EMAIL "")
+  LETSENCRYPT_EMAIL=$(prompt_val LETSENCRYPT_EMAIL "admin@example.com")
 
-  for v in DOMAIN_PORTAINER DOMAIN_TRAEFIK_DASHBOARD DOMAIN_N8N_EDITOR DOMAIN_N8N_WEBHOOK LETSENCRYPT_EMAIL; do
-    if [[ -z "${!v}" ]]; then
-      log_err "Variável obrigatória: $v"
-      exit 1
-    fi
-  done
+  # Placeholders se ainda vazio (Enter em todos)
+  PORTAINER_ADMIN_USER="${PORTAINER_ADMIN_USER:-admin}"
+  DOMAIN_PORTAINER="${DOMAIN_PORTAINER:-portainer.local}"
+  DOMAIN_TRAEFIK_DASHBOARD="${DOMAIN_TRAEFIK_DASHBOARD:-traefik.local}"
+  DOMAIN_N8N_EDITOR="${DOMAIN_N8N_EDITOR:-n8n.local}"
+  DOMAIN_N8N_WEBHOOK="${DOMAIN_N8N_WEBHOOK:-webhook.local}"
+  LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-admin@example.com}"
 
-  # Senhas: gerar se vazias
+  # Senhas: gerar só se vazias (em reexecução, vêm de .setup.env)
   PORTAINER_ADMIN_PASSWORD="${PORTAINER_ADMIN_PASSWORD:-}"
   [[ -z "$PORTAINER_ADMIN_PASSWORD" ]] && PORTAINER_ADMIN_PASSWORD=$(gen_password)
   POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
@@ -86,6 +96,27 @@ gather_inputs() {
   N8N_ENCRYPTION_KEY="${N8N_ENCRYPTION_KEY:-}"
   [[ -z "$N8N_ENCRYPTION_KEY" ]] && N8N_ENCRYPTION_KEY=$(gen_password)
   TZ="${TZ:-America/Sao_Paulo}"
+
+  # Persistir estado para próxima execução (resume)
+  local state_file="${SCRIPT_DIR}/.setup.env"
+  cat > "$state_file" << EOF
+# Estado do setup (gerado automaticamente; não commitar)
+PORTAINER_ADMIN_USER='${PORTAINER_ADMIN_USER}'
+PORTAINER_ADMIN_PASSWORD='${PORTAINER_ADMIN_PASSWORD//\'/\'\\\'\'}'
+DOMAIN_PORTAINER='${DOMAIN_PORTAINER}'
+DOMAIN_TRAEFIK_DASHBOARD='${DOMAIN_TRAEFIK_DASHBOARD}'
+DOMAIN_N8N_EDITOR='${DOMAIN_N8N_EDITOR}'
+DOMAIN_N8N_WEBHOOK='${DOMAIN_N8N_WEBHOOK}'
+LETSENCRYPT_EMAIL='${LETSENCRYPT_EMAIL}'
+POSTGRES_PASSWORD='${POSTGRES_PASSWORD//\'/\'\\\'\'}'
+N8N_DB_USER='${N8N_DB_USER}'
+N8N_DB_NAME='${N8N_DB_NAME}'
+N8N_DB_PASSWORD='${N8N_DB_PASSWORD//\'/\'\\\'\'}'
+REDIS_PASSWORD='${REDIS_PASSWORD//\'/\'\\\'\'}'
+N8N_ENCRYPTION_KEY='${N8N_ENCRYPTION_KEY//\'/\'\\\'\'}'
+TZ='${TZ}'
+EOF
+  chmod 600 "$state_file" 2>/dev/null || true
 }
 
 # -----------------------------------------------------------------------------
@@ -141,17 +172,20 @@ create_network_and_volumes() {
 }
 
 create_configs_and_secret() {
-  log_info "Criando configs e secret..."
+  log_info "Criando configs e secret (pulando se já existirem para permitir resume)..."
 
   # Traefik middlewares
   if ! $SUDO docker config inspect traefik_global_middlewares &>/dev/null; then
     $SUDO docker config create traefik_global_middlewares "${STACKS_DIR}/traefik-dynamic.yml"
+  else
+    log_info "Config traefik_global_middlewares já existe."
   fi
 
-  # Init Postgres: criar usuário e DB n8n (senha escapada para SQL)
-  local n8n_pass_sql="${N8N_DB_PASSWORD//\'/\'\'\'}"
-  local init_script
-  init_script="#!/bin/bash
+  # Init Postgres: criar usuário e DB n8n (só se ainda não existir)
+  if ! $SUDO docker config inspect postgres_init_n8n &>/dev/null; then
+    local n8n_pass_sql="${N8N_DB_PASSWORD//\'/\'\'\'}"
+    local init_script
+    init_script="#!/bin/bash
 set -e
 psql -v ON_ERROR_STOP=1 --username \"\$POSTGRES_USER\" <<EOSQL
 CREATE USER ${N8N_DB_USER} WITH PASSWORD '${n8n_pass_sql}';
@@ -162,17 +196,22 @@ GRANT ALL ON SCHEMA public TO ${N8N_DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${N8N_DB_USER};
 EOSQL
 "
-  local tmp_init="/tmp/postgres_init_n8n_$$.sh"
-  echo "$init_script" > "$tmp_init"
-  chmod 755 "$tmp_init"
-  $SUDO docker config inspect postgres_init_n8n &>/dev/null && $SUDO docker config rm postgres_init_n8n 2>/dev/null || true
-  $SUDO docker config create postgres_init_n8n "$tmp_init"
-  rm -f "$tmp_init"
+    local tmp_init="/tmp/postgres_init_n8n_$$.sh"
+    echo "$init_script" > "$tmp_init"
+    chmod 755 "$tmp_init"
+    $SUDO docker config create postgres_init_n8n "$tmp_init"
+    rm -f "$tmp_init"
+  else
+    log_info "Config postgres_init_n8n já existe."
+  fi
 
-  # Secret senha admin Portainer
-  echo -n "$PORTAINER_ADMIN_PASSWORD" | $SUDO docker secret create portainer_admin_password - 2>/dev/null || \
-    ($SUDO docker secret rm portainer_admin_password 2>/dev/null; echo -n "$PORTAINER_ADMIN_PASSWORD" | $SUDO docker secret create portainer_admin_password -)
-  log_info "Configs e secret criados."
+  # Secret senha admin Portainer (só criar se não existir; em resume usamos a do .setup.env para auth)
+  if ! $SUDO docker secret inspect portainer_admin_password &>/dev/null; then
+    echo -n "$PORTAINER_ADMIN_PASSWORD" | $SUDO docker secret create portainer_admin_password -
+  else
+    log_info "Secret portainer_admin_password já existe."
+  fi
+  log_info "Configs e secret ok."
 }
 
 # Deploy Portainer via docker stack (para ter API disponível)
